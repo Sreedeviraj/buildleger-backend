@@ -1,0 +1,355 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Every table that holds a company's data has a companyId, and every query filters by it,
+// so one company can never see another's records.
+//
+// Money: whole rupees as Int (max ₹214 crore per amount; the API rejects anything larger).
+// Dates the user picks (payment date, bill date…) are @db.Date: a calendar day, no time zone.
+// Money records are never deleted: they are voided (voidedAt + reason) and every change is in AuditEvent.
+
+// ---------------- Enums ----------------
+
+enum Role {
+  owner
+  manager
+  staff
+}
+
+enum ProjectStatus {
+  ongoing
+  on_hold
+  completed
+}
+
+enum PaymentKind {
+  advance
+  installment
+  final
+  refund
+}
+
+enum PaymentMode {
+  cash
+  upi
+  bank
+  cheque
+}
+
+enum ExpenseCategory {
+  materials
+  labour
+  subcontractor
+  equipment
+  transport
+  rent
+  permits
+  electrical
+  plumbing
+  other
+}
+
+enum SupplierType {
+  supplier
+  subcontractor
+  labour
+}
+
+enum AuditEntity {
+  project
+  payment
+  expense
+  bill
+  supplier
+  installment
+}
+
+enum AuditAction {
+  created
+  updated
+  voided
+  archived
+  restored
+  deleted
+}
+
+// ---------------- Company, people, login ----------------
+
+model Company {
+  id              String           @id @default(cuid())
+  name            String
+  city            String
+  createdAt       DateTime         @default(now())
+  users           User[]
+  invites         Invite[]
+  projects        Project[]
+  suppliers       Supplier[]
+  payments        Payment[]
+  expenses        Expense[]
+  bills           Bill[]
+  installments    Installment[]
+  budgetRevisions BudgetRevision[]
+  auditEvents     AuditEvent[]
+  attachments     Attachment[]
+}
+
+model User {
+  id           String    @id @default(cuid())
+  companyId    String
+  company      Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name         String
+  email        String    @unique
+  passwordHash String
+  role         Role      @default(staff)
+  createdAt    DateTime  @default(now())
+  sessions     Session[]
+
+  @@index([companyId])
+}
+
+/// An invitation to join a company. The link holds a random token; only its hash is stored.
+model Invite {
+  id          String    @id @default(cuid())
+  companyId   String
+  company     Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name        String
+  email       String
+  role        Role
+  tokenHash   String    @unique
+  invitedById String
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([companyId])
+}
+
+model Session {
+  id        String   @id // SHA-256 hash of the cookie token, never the token itself
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ---------------- Projects ----------------
+
+model Project {
+  id              String           @id @default(cuid())
+  companyId       String
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name            String
+  clientName      String
+  clientPhone     String           @default("")
+  clientEmail     String           @default("")
+  clientAddress   String           @default("")
+  location        String // site address
+  contractValue   Int // what the client agreed to pay
+  estimatedCost   Int // approved budget
+  categoryBudgets Json             @default("{}") // { materials: 1500000, labour: 900000, ... }
+  startDate       DateTime         @default(now()) @db.Date
+  expectedEndDate DateTime?        @db.Date
+  progress        Int              @default(0) // 0-100
+  status          ProjectStatus    @default(ongoing)
+  archived        Boolean          @default(false)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  payments        Payment[]
+  expenses        Expense[]
+  bills           Bill[]
+  installments    Installment[]
+  budgetRevisions BudgetRevision[]
+
+  @@index([companyId])
+}
+
+/// A scheduled client payment (milestone), used to work out overdue amounts.
+model Installment {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  label     String
+  amount    Int
+  dueDate   DateTime @db.Date
+  createdAt DateTime @default(now())
+
+  @@index([companyId])
+  @@index([projectId])
+}
+
+model BudgetRevision {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  byName    String
+  reason    String
+  before    Json // { estimatedCost, categoryBudgets }
+  after     Json
+  at        DateTime @default(now())
+
+  @@index([projectId])
+}
+
+// ---------------- Suppliers ----------------
+
+model Supplier {
+  id        String       @id @default(cuid())
+  companyId String
+  company   Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name      String
+  type      SupplierType
+  phone     String       @default("")
+  note      String       @default("")
+  archived  Boolean      @default(false)
+  createdAt DateTime     @default(now())
+  expenses  Expense[]
+  bills     Bill[]
+
+  @@index([companyId])
+}
+
+// ---------------- Money ----------------
+
+/// Money received from (or refunded to) the client. Amount is always positive.
+model Payment {
+  id           String      @id @default(cuid())
+  companyId    String
+  company      Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  projectId    String
+  project      Project     @relation(fields: [projectId], references: [id])
+  kind         PaymentKind
+  amount       Int
+  date         DateTime    @db.Date
+  mode         PaymentMode
+  reference    String      @default("")
+  note         String      @default("")
+  voidedAt     DateTime?
+  voidedByName String?
+  voidReason   String?
+  createdById  String
+  createdBy    String
+  requestId    String?     @unique // a repeated submit with the same id returns the first record
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@index([companyId])
+  @@index([projectId])
+}
+
+/// Money paid out for the project. Linked to a bill when it settles one.
+model Expense {
+  id           String          @id @default(cuid())
+  companyId    String
+  company      Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  projectId    String
+  project      Project         @relation(fields: [projectId], references: [id])
+  amount       Int
+  date         DateTime        @db.Date
+  category     ExpenseCategory
+  supplierId   String?
+  supplier     Supplier?       @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  billId       String?
+  bill         Bill?           @relation(fields: [billId], references: [id], onDelete: Restrict)
+  paidTo       String          @default("")
+  mode         PaymentMode
+  invoiceRef   String          @default("")
+  note         String          @default("")
+  voidedAt     DateTime?
+  voidedByName String?
+  voidReason   String?
+  createdById  String
+  createdBy    String
+  requestId    String?         @unique
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  attachments  Attachment[]
+
+  @@index([companyId])
+  @@index([projectId])
+  @@index([billId])
+  @@index([supplierId])
+}
+
+/// A supplier/subcontractor bill: cost incurred, paid later through linked expenses.
+model Bill {
+  id           String          @id @default(cuid())
+  companyId    String
+  company      Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  projectId    String
+  project      Project         @relation(fields: [projectId], references: [id])
+  supplierId   String
+  supplier     Supplier        @relation(fields: [supplierId], references: [id])
+  category     ExpenseCategory
+  billNumber   String          @default("")
+  billDate     DateTime        @db.Date
+  dueDate      DateTime?       @db.Date
+  amount       Int
+  note         String          @default("")
+  voidedAt     DateTime?
+  voidedByName String?
+  voidReason   String?
+  createdById  String
+  createdBy    String
+  requestId    String?         @unique
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  expenses     Expense[]
+  attachments  Attachment[]
+
+  @@index([companyId])
+  @@index([projectId])
+  @@index([supplierId])
+}
+
+/// A file (receipt, bill photo) attached to an expense or a bill.
+model Attachment {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  expenseId   String?
+  expense     Expense? @relation(fields: [expenseId], references: [id])
+  billId      String?
+  bill        Bill?    @relation(fields: [billId], references: [id])
+  name        String
+  mimeType    String
+  size        Int
+  storagePath String
+  uploadedBy  String
+  createdAt   DateTime @default(now())
+
+  @@index([companyId])
+  @@index([expenseId])
+  @@index([billId])
+}
+
+// ---------------- Audit ----------------
+
+/// Who changed what and when. Never updated or deleted.
+model AuditEvent {
+  id        String      @id @default(cuid())
+  companyId String
+  company   Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  projectId String? // null for company-level records and deleted projects
+  entity    AuditEntity
+  entityId  String
+  action    AuditAction
+  byName    String
+  changes   Json        @default("[]") // [{ field, from, to }]
+  reason    String      @default("")
+  at        DateTime    @default(now())
+
+  @@index([companyId, projectId])
+  @@index([entityId])
+}
