@@ -5,7 +5,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts"
+    "dev": "tsx watch src/server.ts",
+    "build": "prisma generate && tsc",
+    "start": "prisma migrate deploy && node dist/server.js",
+    "seed": "prisma db seed"
   },
   "keywords": [],
   "author": "",
